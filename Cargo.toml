@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gg-sms",
+    "apps/gg_madou_patch",
+]

@@ -1,0 +1,24 @@
+/target/
+
+# User-supplied copyrighted or private inputs
+/assets/fonts/
+/assets/translations/
+/assets/graphics/*_en.bin
+/assets/graphics/*_jp.bin
+/roms/
+
+# Generated outputs
+/out/
+*.gg
+*.sms
+*.bps
+*.ips
+*.sav
+*.state*
+*.gearsystem
+
+# Local evidence and tooling state
+/.emucap/
+/.claude/
+**/.DS_Store
+*.log
