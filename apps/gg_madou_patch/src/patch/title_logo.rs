@@ -171,8 +171,10 @@ fn render_surface(tiles: &[u8], map: &[u8]) -> Result<Vec<u8>> {
         );
     }
     let decoded: Vec<_> = tiles
-        .chunks_exact(32)
-        .map(decode_tile)
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .map(|tile| decode_tile(tile))
         .collect::<Result<_>>()?;
     let mut surface = vec![0u8; SURFACE_WIDTH * SURFACE_HEIGHT];
     for position in 0..OUTPUT_TILE_COUNT {
@@ -597,7 +599,11 @@ mod tests {
             eprintln!("skip: JP ROM absent");
             return;
         };
-        for tile in jp[SOURCE_TILE_BASE..SOURCE_TILE_BASE + SOURCE_TILE_BYTES].chunks_exact(32) {
+        for tile in jp[SOURCE_TILE_BASE..SOURCE_TILE_BASE + SOURCE_TILE_BYTES]
+            .as_chunks::<32>()
+            .0
+            .iter()
+        {
             let pixels = decode_tile(tile).expect("decode");
             assert_eq!(encode_tile(&pixels).expect("encode").as_slice(), tile);
         }

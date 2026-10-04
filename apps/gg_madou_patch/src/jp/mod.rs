@@ -624,21 +624,15 @@ fn validate_translation_corpus(
     })
 }
 
-/// Normalize the bank3/third records whose JP pointer ranges cross from the
-/// ending-credit stream into adjacent system data.
-///
-/// JP id 133 starts a fixed-page ending/credit stream with no `$FE`. Id 255
-/// points exactly at the following non-text system-data suffix. Treating both
-/// as ordinary unterminated strings copies the rest of bank 3 (4 KiB+) into
-/// spare 37 and cannot fit. Id 133 is the translated suffix of the full ending
-/// chain at id 160; id 255 becomes a defensive immediate END in the relocated
-/// *text* table. The original bank-3 system data is never modified.
+/// Bound the ending stream at its final source PAGE rather than scanning into
+/// adjacent system data. The last record is the native copyright line, consumed
+/// by the credits' fixed-PAGE caller; CLOSE would wait for input and erase art.
 fn normalize_jp_mixed_third_entries(
     jp: &[u8],
     partitioned: &mut crate::text::relocation::PartitionedTranslations,
 ) -> Result<()> {
     const CREDITS_ID: u16 = 133;
-    const DATA_SENTINEL_ID: u16 = 255;
+    const COPYRIGHT_ID: u16 = 255;
     const ENDING_CHAIN_ID: u16 = 160;
 
     let source_config = crate::text::bank::config_for_bank(3).expect("bank3 config");
@@ -654,7 +648,7 @@ fn normalize_jp_mixed_third_entries(
     };
     let bank_offset = |ptr: u16| ptr as usize + (source_table.base_logical as usize - 0x8000);
     let credits_start = bank_offset(pointer(CREDITS_ID));
-    let data_start = bank_offset(pointer(DATA_SENTINEL_ID));
+    let data_start = bank_offset(pointer(COPYRIGHT_ID));
     if credits_start >= data_start || data_start > BANK_SIZE {
         bail!(
             "JP mixed third boundary invalid: id133=${credits_start:04X}, id255=${data_start:04X}"
@@ -722,18 +716,59 @@ fn normalize_jp_mixed_third_entries(
     }
     let translated_credits_len = entries[credits_idx].data.len();
 
+    // The ending also calls individual IDs, so equal total PAGE counts alone
+    // do not guarantee that a caller receives the intended line.
+    let ending = &entries[ending_idx].data;
+    let source_ending = bank_offset(pointer(ENDING_CHAIN_ID));
+    for entry in entries
+        .iter()
+        .filter(|entry| (160..=254).contains(&entry.id))
+    {
+        let source_start = bank_offset(pointer(entry.id));
+        if source_start < source_ending || !ending.ends_with(&entry.data) {
+            bail!("ending entry {} is not a source-aligned suffix", entry.id);
+        }
+        let source_pages = jp[source_config.physical_base + source_ending
+            ..source_config.physical_base + source_start]
+            .iter()
+            .filter(|&&byte| byte == crate::text::control::CTRL_PAGE)
+            .count();
+        let translated_pages = count_jp_direct_controls(
+            &ending[..ending.len() - entry.data.len()],
+            crate::text::control::CTRL_PAGE,
+        );
+        if source_pages != translated_pages {
+            bail!(
+                "ending entry {} selects PAGE {} instead of source PAGE {}",
+                entry.id,
+                translated_pages,
+                source_pages
+            );
+        }
+    }
+
     let data_entry = entries
         .iter_mut()
-        .find(|entry| entry.id == DATA_SENTINEL_ID)
-        .context("JP mixed third data sentinel entry 255 missing")?;
+        .find(|entry| entry.id == COPYRIGHT_ID)
+        .context("JP final copyright entry 255 missing")?;
     if !data_entry.skip || !data_entry.data.is_empty() {
         bail!("JP mixed third entry 255 is no longer an explicit source-copy");
     }
-    data_entry.data = vec![crate::text::control::CTRL_CLOSE];
+    let copyright_start = source_config.physical_base + data_start;
+    let copyright = &jp[copyright_start..copyright_start + 19];
+    if copyright
+        != [
+            0x00, 0x22, 0x02, 0x0A, 0x0A, 0x04, 0x00, 0x26, 0x30, 0x31, 0x34, 0x49, 0x48, 0x39,
+            0x3A, 0x3B, 0x3D, 0x3E, 0xFF,
+        ]
+    {
+        bail!("JP final copyright PAGE signature changed");
+    }
+    data_entry.data = copyright.to_vec();
     data_entry.skip = false;
 
     println!(
-        "  Mixed third: id133 translated suffix {}B (source boundary {}B); id255 isolated as non-text",
+        "  Mixed third: id133 translated suffix {}B (source boundary {}B); id255 native copyright PAGE preserved",
         translated_credits_len,
         credits.len(),
     );
@@ -930,8 +965,8 @@ mod tests {
             stats,
             CorpusStats {
                 translated: 1028,
-                source_copy: 0,
-                non_text: 1,
+                source_copy: 1,
+                non_text: 0,
                 active: 1029,
             }
         );
@@ -1191,14 +1226,18 @@ mod tests {
         };
         let credits_start = entry_start(133);
         let ending_start = entry_start(160);
-        let shared_credits_start = entry_start(237);
+        let following_credits_start = entry_start(237);
         assert!(
             credits_start > ending_start,
             "translated id133 must point inside the earlier id160 ending chain"
         );
         assert_eq!(
-            credits_start, shared_credits_start,
-            "translated id133 must share the exact id237 ending suffix"
+            count_jp_direct_controls(
+                &out[credits_start..following_credits_start],
+                crate::text::control::CTRL_PAGE
+            ),
+            1,
+            "id133 precedes id237 by one PAGE in the original ending stream"
         );
         assert!(
             (render::JP_KO_PREFIX_START..=render::JP_KO_PREFIX_END).contains(&out[credits_start]),
@@ -1237,6 +1276,20 @@ mod tests {
                 ids[0],
                 ids[1]
             );
+            let source_start = |id: usize| {
+                let at = 0xDD40 + id * 2;
+                0xDD40 + u16::from_le_bytes([jp[at], jp[at + 1]]) as usize
+            };
+            assert_eq!(
+                count_jp_direct_controls(&out[current..next], crate::text::control::CTRL_PAGE),
+                jp[source_start(ids[0])..source_start(ids[1])]
+                    .iter()
+                    .filter(|&&b| b == crate::text::control::CTRL_PAGE)
+                    .count(),
+                "each ending ID must select the same PAGE as the original: {} -> {}",
+                ids[0],
+                ids[1]
+            );
             assert_eq!(
                 out[next - 1],
                 crate::text::control::CTRL_PAGE,
@@ -1249,9 +1302,9 @@ mod tests {
         let ptr = u16::from_le_bytes([out[ptr_off], out[ptr_off + 1]]);
         let text_off = third.physical_base + ptr as usize + (table.base_logical as usize - 0x8000);
         assert_eq!(
-            out[text_off],
-            crate::text::control::CTRL_CLOSE,
-            "non-text id255 must be isolated from relocated text"
+            &out[text_off..text_off + 19],
+            &jp[0xEFE9..0xEFFC],
+            "final copyright must return at its native PAGE without opening a dialog"
         );
     }
 }
